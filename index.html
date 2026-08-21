@@ -176,7 +176,7 @@
 <div class="section">
   <h2>Environment</h2>
   <ul class="env-list">
-    <li>Apache Airflow 2.6.2 / LocalExecutor — under LocalExecutor the scheduler also runs the tasks, so what would be a separate worker pod in other setups is the scheduler pod here.</li>
+    <li>Apache Airflow 2.6.2 / LocalExecutor (scheduler == worker)</li>
     <li>Worker parallelism: 200 (sensor pool: 100 + compute task pool: 100) / Triggerer: 3 processes (capacity 1,000 each)</li>
     <li>Custom sensors: sensors that query Meta DB to detect task and Sqoop completion. About 2,500 total</li>
   </ul>
