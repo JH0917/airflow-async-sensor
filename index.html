@@ -168,7 +168,7 @@
 
 <h1>Moving Airflow Sensors to Async Execution</h1>
 <div class="highlight">
-  Sensor Worker slot usage: 100 → 0 / Scheduling delays: 3–4/month → 0 / Batch pipeline failures resolved
+  Sensor Worker slot usage: 100 → 0 / Scheduling delays: 3–4/month → 0 / Compute task slots: ~100 → ~200
 </div>
 
 <hr>
@@ -176,7 +176,7 @@
 <div class="section">
   <h2>Environment</h2>
   <ul class="env-list">
-    <li>Apache Airflow 2.6.2 / LocalExecutor</li>
+    <li>Apache Airflow 2.6.2 / LocalExecutor — under LocalExecutor the scheduler also runs the tasks, so what would be a separate worker pod in other setups is the scheduler pod here.</li>
     <li>Worker parallelism: 200 (sensor pool: 100 + compute task pool: 100) / Triggerer: 3 processes (capacity 1,000 each)</li>
     <li>Custom sensors: sensors that query Meta DB to detect task and Sqoop completion. About 2,500 total</li>
   </ul>
@@ -271,13 +271,13 @@ async def run_trigger(self, trigger_id, trigger):
 
 <div class="section">
   <h2>Pre-work 2: Reducing DB Load</h2>
-  <p>If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not handle this, so the load needed to be reduced before the migration.</p>
+  <p>If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not be able to handle this, so the load needed to be reduced before the migration.</p>
 
   <h3>1) Combining Sqoop sensors — per-table → per-host</h3>
   <p>The custom sensors detect Sqoop completion by querying a DB. The Sqoop DAG (running on a different Airflow) also queries the same DB, so reducing queries on the Sqoop side also reduces load. In the existing Sqoop DAG, <strong>each table had its own sensor</strong>, running a separate SELECT per table. <strong>Combined these into 1 sensor per host</strong> to reduce query count (e.g. 200–300 queries per host → 1).</p>
 
   <h3>2) Airflow Variable caching</h3>
-  <p>To prevent this query concentration, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought DB CPU from 70% → near 0%</strong>. The 5-minute interval was acceptable because the existing poke interval was already 3 minutes.</p>
+  <p>To prevent this query concentration, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought DB CPU from 70% → near 0%</strong>. The cache adds at most 5 minutes of staleness on top of the 3-minute poke interval. That was acceptable against what was being fixed — detections that were running over an hour late.</p>
 
   <div class="img-container">
     <figure>
@@ -363,7 +363,7 @@ async def run_trigger(self, trigger_id, trigger):
     <li>Ran async sensors during the actual batch at night, then compared results with the existing sync sensors to <strong>check if detection was correct</strong></li>
     <li>Ran continuously since May, monitoring for <strong>event loop blocking, memory leaks, and missed triggers</strong></li>
   </ul>
-  <p>During testing, found a <strong>timeout problem</strong>. Which timeout it is turned out to matter. The sensor's own <code>timeout</code> parameter is measured from the <code>start_date</code> of the first <code>TaskReschedule</code> record of that try, so it does not reset on each poke and behaves similarly in both modes. The asymmetry comes from <code>execution_timeout</code>. In reschedule mode each poke is a separate task execution, so <code>_execute_task</code> passes the full <code>execution_timeout</code> every time — effectively resetting it. In deferred mode <code>_defer_task</code> pins <code>trigger_timeout = start_date + execution_timeout</code> once, and <code>start_date</code> is preserved across resumes, so the entire wait counts as one continuous run. Sensors that are supposed to wait for hours started failing from timeout even though they were working correctly. Removed the timeout setting for deferred sensors. A sensor stuck long enough to matter is caught by a separate SLA check instead — sensors poke frequently, so a per-task timeout was mostly firing on transient errors and waking people during the night batch.</p>
+  <p>During testing, found a <strong>timeout problem</strong>. It turned out to matter which timeout was in play. The sensor's own <code>timeout</code> parameter is measured from the <code>start_date</code> of the first <code>TaskReschedule</code> record of that try, so it does not reset on each poke and behaves similarly in both modes. The asymmetry comes from <code>execution_timeout</code>. In reschedule mode each poke is a separate task execution, so <code>_execute_task</code> passes the full <code>execution_timeout</code> every time — effectively resetting it. In deferred mode <code>_defer_task</code> pins <code>trigger_timeout = start_date + execution_timeout</code> once, and <code>start_date</code> is preserved across resumes, so the entire wait counts as one continuous run. Sensors that are supposed to wait for hours started timing out even though they were working correctly. Removed the timeout setting for deferred sensors. A sensor stuck long enough to matter is caught by a separate SLA check instead — sensors poke frequently, so a per-task timeout was mostly firing on transient errors and waking people during the night batch.</p>
   <figure>
     <img src="./comparison.png" alt="Test cluster vs production comparison" style="max-width: 500px;">
     <figcaption>Test cluster vs production after deployment</figcaption>
@@ -387,7 +387,6 @@ async def run_trigger(self, trigger_id, trigger):
   <ul>
     <li><strong>Cause</strong> — Airflow builds a URL from the <code>host_name</code> the Triggerer registers in Meta DB to request logs, using <code>hostname_callable</code> first and falling back to FQDN.</li>
   </ul>
-  <p style="font-size:9.5pt;color:#555;margin-bottom:6px;">Under LocalExecutor the scheduler also runs the tasks, so what would be a separate worker pod in other setups is the scheduler pod here.</p>
   <table>
     <tr><th></th><th>Deployment Type</th><th>Pod Name</th><th>DNS Resolution</th></tr>
     <tr><td>Scheduler</td><td>StatefulSet</td><td>Stable</td><td>Resolvable via Headless Service</td></tr>
@@ -408,7 +407,6 @@ async def run_trigger(self, trigger_id, trigger):
     <tr><td><strong>Sensor pool usage</strong></td><td>100 (always full)</td><td><strong>0 (pool not needed)</strong></td></tr>
     <tr><td><strong>Scheduling delays (1 hour+)</strong></td><td>3–4 per month</td><td><strong>0</strong></td></tr>
     <tr><td><strong>Compute task slots available</strong></td><td>~100 (half of parallelism)</td><td><strong>~200 (all available)</strong></td></tr>
-    <tr><td><strong>Batch failures (caused by sensors)</strong></td><td>Happened sometimes</td><td><strong>Resolved</strong></td></tr>
   </table>
   <p>Stable in production.</p>
 </div>
