@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Portfolio — Async Sensor Migration in Airflow</title>
+<style>
+  @page { margin: 0.6in 0.7in; size: A4; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: 10.5pt;
+    line-height: 1.5;
+    color: #1a1a1a;
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 40px 50px;
+  }
+  h1 {
+    font-size: 18pt;
+    font-weight: bold;
+    margin-bottom: 6px;
+    letter-spacing: 0.5px;
+  }
+  .highlight {
+    font-size: 10pt;
+    color: #333;
+    background: #f5f5f5;
+    border-left: 3px solid #1a1a1a;
+    padding: 8px 12px;
+    margin-bottom: 16px;
+  }
+  hr {
+    border: none;
+    border-top: 1.5px solid #1a1a1a;
+    margin: 16px 0;
+  }
+  h2 {
+    font-size: 12pt;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 8px;
+  }
+  h3 {
+    font-size: 10.5pt;
+    font-weight: bold;
+    margin-top: 10px;
+    margin-bottom: 4px;
+  }
+  p {
+    margin-bottom: 8px;
+    text-align: justify;
+  }
+  ul {
+    margin-left: 18px;
+    margin-bottom: 8px;
+  }
+  li {
+    margin-bottom: 4px;
+  }
+  .env-list {
+    list-style: none;
+    margin-left: 0;
+  }
+  .env-list li::before {
+    content: "• ";
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 12px;
+    font-size: 10pt;
+  }
+  th, td {
+    border: 1px solid #ccc;
+    padding: 6px 10px;
+    text-align: left;
+  }
+  th {
+    background: #f5f5f5;
+    font-weight: bold;
+  }
+  pre {
+    background: #f8f8f8;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 10px 12px;
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 9pt;
+    line-height: 1.4;
+    overflow-x: auto;
+    margin-bottom: 10px;
+  }
+  code {
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 9.5pt;
+    background: #f0f0f0;
+    padding: 1px 4px;
+    border-radius: 2px;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+  }
+  .img-container {
+    display: flex;
+    gap: 12px;
+    margin: 10px 0;
+    align-items: flex-start;
+  }
+  .img-container figure {
+    flex: 1;
+    text-align: center;
+  }
+  .img-container img {
+    width: 100%;
+    max-width: 320px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+  }
+  figure {
+    margin: 10px 0;
+    text-align: center;
+  }
+  figure img {
+    max-width: 340px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+  }
+  figcaption {
+    font-size: 9pt;
+    color: #666;
+    margin-top: 4px;
+    font-style: italic;
+  }
+  .diagram {
+    background: #f8f8f8;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 12px 16px;
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 9pt;
+    line-height: 1.5;
+    margin-bottom: 10px;
+    white-space: pre;
+  }
+  blockquote {
+    font-size: 9.5pt;
+    color: #555;
+    font-style: italic;
+    margin: 4px 0 10px 0;
+  }
+  .section { margin-bottom: 16px; }
+  .tag {
+    font-size: 9pt;
+    color: #888;
+    font-style: italic;
+    margin-top: 20px;
+  }
+  @media print {
+    body { padding: 0; }
+    .img-container img { max-width: 280px; }
+    figure img { max-width: 300px; }
+  }
+</style>
+</head>
+<body>
+
+<h1>Moving Airflow Sensors to Async Execution</h1>
+<div class="highlight">
+  Sensor Worker slot usage: 100 → 0 / Scheduling delays: 3–4/month → 0 / Batch pipeline failures resolved
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Environment</h2>
+  <ul class="env-list">
+    <li>Apache Airflow 2.6.2 / LocalExecutor</li>
+    <li>Worker parallelism: 200 (sensor pool: 100 + compute task pool: 100) / Triggerer: 3 processes (capacity 1,000 each)</li>
+    <li>Custom sensors: sensors that query Meta DB to detect task and Sqoop completion. About 2,500 total</li>
+  </ul>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Problem</h2>
+  <p>We had 200 total parallelism, and <strong>100 slots were reserved for a sensor-only pool</strong>. There were about 2,500 sensors running in reschedule mode — when a poke fails, the sensor gives back the Worker slot. But because 2,500 sensors were competing for 100 slots, whenever one slot was released, another sensor took it right away. So <strong>the sensor pool was always full at 100</strong>.</p>
+  <ul>
+    <li><strong>Competition inside the sensor pool</strong> — 2,500 sensors fighting for 100 slots. When more than 100 needed to run at the same time, reschedule got delayed. There were cases where a finished task was not detected for over an hour. This happened 3–4 times per month.</li>
+    <li><strong>Effect on compute tasks</strong> — The sensor pool was always using its full 100 slots, so compute tasks could only use 100 out of 200 parallelism. During peak batch hours, compute tasks also had to wait for slots.</li>
+  </ul>
+
+  <h3>Actual delay case (2026-05-04)</h3>
+  <div class="img-container">
+    <figure>
+      <img src="./scheduling_delay_sensor_log.png" alt="Sensor log — 1 hour+ scheduling gap">
+      <figcaption>Sensor was rescheduled at 01:10:31, but the next scheduling happened at 02:18:38. No slot was available for 1 hour 8 minutes.</figcaption>
+    </figure>
+    <figure>
+      <img src="./scheduling_delay_sqoop_finish.png" alt="Sqoop actual finish time">
+      <figcaption>Sqoop finished at 01:16:43 (scrap_end). The sensor's last check was at 01:10, and it did not get a slot again until 02:18 — so the 01:16 completion was detected 1 hour later.</figcaption>
+    </figure>
+  </div>
+
+  <p>The root cause was that <strong>sensors run synchronously on the Worker process</strong> — a sensor holds a Worker slot <strong>while poking</strong>, and a waiting sensor has to take one again on every cycle. The structure itself was the problem.</p>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Alternatives Considered</h2>
+  <table>
+    <tr><th>Option</th><th>Judgment</th></tr>
+    <tr><td><strong>Tune reschedule mode</strong></td><td>Already applied, but too many sensors caused scheduler overhead and rescheduling itself got delayed. Does not fix the real problem.</td></tr>
+    <tr><td><strong>Increase Worker parallelism / sensor pool</strong></td><td>Sensors only wait, so giving them more Worker slots wastes resources. Just avoiding the problem, not fixing it.</td></tr>
+    <tr><td><strong>Switch to CeleryExecutor</strong></td><td>Workers run on separate nodes so scheduler load goes down, but sensors still take a Worker slot on every poke. Needs extra infrastructure but does not fix the real problem.</td></tr>
+    <tr><td><strong>Move sensors to Triggerer (async)</strong></td><td>Sensors are waiting tasks, so they should run on the async event loop. This fixes the structure.</td></tr>
+  </table>
+  <p>→ <strong>Chose the Triggerer async approach.</strong> Unlike Workers (synchronous, OS process per task), the Triggerer runs on an asyncio event loop with coroutines, so a single process can hold on the order of a thousand waiting tasks (capacity 1,000 each here).</p>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Analysis: Triggerer Internals</h2>
+  <p>To understand whether sensors could move to the Triggerer, I read the Airflow source code directly and found this structure:</p>
+  <div class="diagram">[Triggerer Process]
+  ├─ async thread: TriggerRunner.start()
+  │    └→ runs each trigger's run() coroutine
+  │    └→ when condition is met, stores TriggerEvent in deque
+  │
+  └─ main thread: _run_trigger_loop()
+       └→ DB operations (fetch triggers)
+       └→ heartbeat: sends alive signal</div>
+  <p>The key structure confirmed from the source code: (<code>airflow/jobs/triggerer_job_runner.py</code>)</p>
+<pre><code># Main thread — synchronous DB operations and heartbeat
+def _run_trigger_loop(self) -> None:
+    while not self.trigger_runner.stop:
+        Trigger.clean_unused()
+        self.load_triggers()
+        self.handle_events()
+        self.handle_failed_triggers()
+        perform_heartbeat(self.job, heartbeat_callback=self.heartbeat_callback, ...)
+        time.sleep(1)
+
+# Async thread — runs each trigger's run() coroutine, pushes events to deque
+async def run_trigger(self, trigger_id, trigger):
+    async for event in trigger.run():
+        self.triggers[trigger_id]["events"] += 1
+        self.events.append((trigger_id, event))</code></pre>
+  <p>When an Operator calls <code>self.defer()</code>, the <strong>Worker slot is released right away</strong>, and the waiting logic runs as a coroutine in the TriggerRunner's event loop. When the condition is met, the flow is: TriggerEvent → main thread's handle_event → Scheduler → Worker gets assigned again.</p>
+  <p>From this, confirmed that <strong>if the sensor's poke logic runs inside <code>BaseTrigger.run()</code> as a coroutine, the sensor can detect the same things without using any Worker slots</strong>.</p>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Pre-work 1: Making the Triggerer Stable</h2>
+
+  <h3>1) Applying lazyload to bulk_fetch</h3>
+  <p>Heartbeat was not reaching the Scheduler even though the async thread and coroutines were running fine. Checked logs on the pod and ran <code>SHOW PROCESSLIST</code> on the Meta DB — found that a specific query was running for more than 10 minutes. Traced it back to the <code>bulk_fetch</code> function in the Airflow source code — in 2.6.2, the SQLAlchemy relationship on <code>task_instance</code> was configured to always inner join <code>dag_run</code>, even though the Triggerer never uses <code>dag_run</code> columns. This join was blocking the main loop for up to 205 seconds, so heartbeat could not be sent. The consequence was not just a late signal — <code>Trigger.assign_unassigned</code> treats a Triggerer whose <code>latest_heartbeat</code> is older than <strong>30 seconds</strong> as dead and reassigns its triggers to another Triggerer. At nearly seven times that threshold (205s vs 30s), the Triggerer was losing its own triggers. <strong>Applied lazyload to disable this join</strong>, and heartbeat came back.</p>
+
+  <h3>2) Building a liveness check for deferred tasks</h3>
+  <p>After fixing the heartbeat, a different problem appeared — some tasks got stuck in a <strong>permanently deferred</strong> state. Triggers were assigned but no coroutines were running. The exact root cause was unclear; suspected to be related to multi-triggerer interception in the open source, but never reproduced. Built a liveness check anyway: if <code>assigned_trigger_ids</code> exist but <code>running == 0 and queued == 0</code>, exit the loop and let the process restart. But this caused false positives — sometimes triggers were still in the middle of registering, not actually stuck. Improved it by adding a <strong><code>self._no_trigger_count</code> counter</strong> that only triggers the restart when this condition happens 5 times in a row.</p>
+  <p> The in-house check kept it contained, but it left me interested in orphan triggers as a failure class in their own right. Airflow 3 had since restructured the Triggerer — the single main/async loop became a supervisor and a subprocess — so the code I had debugged in 2.6.2 no longer existed in that form. Reading the newer implementation, I found a distinct path to the same symptom: the supervisor can keep a trigger in <code>running_triggers</code> while no coroutine is actually running it in the subprocess, and the task stays deferred forever. I submitted a detection-and-recovery patch upstream — the supervisor compares its own <code>running_triggers</code> count against the subprocess's actual trigger count on every sync cycle, and when they diverge it drops only the stranded trigger ids so the next cycle rebuilds them, instead of shutting the whole Triggerer down. Shipped with a <code>triggers.state_mismatch</code> metric and tests. (<a href="https://github.com/apache/airflow/pull/68792">apache/airflow#68792</a>, milestone 3.3.2, under review)</p>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Pre-work 2: Reducing DB Load</h2>
+  <p>If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not handle this, so the load needed to be reduced before the migration.</p>
+
+  <h3>1) Combining Sqoop sensors — per-table → per-host</h3>
+  <p>The custom sensors detect Sqoop completion by querying a DB. The Sqoop DAG (running on a different Airflow) also queries the same DB, so reducing queries on the Sqoop side also reduces load. In the existing Sqoop DAG, <strong>each table had its own sensor</strong>, running a separate SELECT per table. <strong>Combined these into 1 sensor per host</strong> to reduce query count (e.g. 200–300 queries per host → 1).</p>
+
+  <h3>2) Airflow Variable caching</h3>
+  <p>To prevent this query concentration, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought DB CPU from 70% → near 0%</strong>. The 5-minute interval was acceptable because the existing poke interval was already 3 minutes.</p>
+
+  <div class="img-container">
+    <figure>
+      <img src="./db_cpu_before.png" alt="DB CPU Before" style="width: 280px; height: 240px; object-fit: contain;">
+      <figcaption>Before optimization: CPU spiked to 70% during batch hours</figcaption>
+    </figure>
+    <figure>
+      <img src="./db_cpu_after.png" alt="DB CPU After" style="width: 280px; height: 240px; object-fit: contain;">
+      <figcaption>After optimization: CPU stays close to 0%</figcaption>
+    </figure>
+  </div>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Implementation: Moving Sensors to Async</h2>
+  <p>Sensors inherit from <code>BaseSensorOperator</code> and can only run on Worker processes. I <strong>built a custom trigger-backed sensor by additionally inheriting <code>BaseTrigger</code>, so the same poke logic can also run on the Triggerer process</strong>, and kept the existing sync path behind a flag.</p>
+
+<pre><code>class CustomTaskCompletionTrigger(BaseTrigger):
+    def __init__(self, target_task_id, poke_interval=60):
+        super().__init__()
+        self.target_task_id = target_task_id
+        self.poke_interval = poke_interval
+
+    def serialize(self):
+        return ("custom_triggers.CustomTaskCompletionTrigger", {
+            "target_task_id": self.target_task_id,
+            "poke_interval": self.poke_interval,
+        })
+
+    async def run(self):
+        while True:
+            if await self._check_task_completion():
+                yield TriggerEvent({"status": "completed"})
+                return
+            await asyncio.sleep(self.poke_interval)
+
+  # _check_task_completion uses the same logic as the original CustomTaskSensor</code></pre>
+
+<pre><code>class CustomTaskSensor(BaseSensorOperator):
+    def __init__(self, *args, use_async=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_async = use_async
+
+    def execute(self, context):
+        if self.use_async:
+            self.defer(
+                trigger=CustomTaskCompletionTrigger(
+                    target_task_id=self.target_task_id,
+                    poke_interval=self.poke_interval,
+                ),
+                method_name="on_complete",
+            )
+        else:
+            super().execute(context)
+
+    def on_complete(self, context, event):
+        if event["status"] != "completed":
+            raise AirflowException("Sensor failed")</code></pre>
+
+  <blockquote>This is pseudocode to show the main structure. The actual production code is different.</blockquote>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Testing: Isolated Production-like Cluster</h2>
+  <p>Before applying to production, I <strong>built a separate Airflow cluster with the same setup</strong>.</p>
+  <div class="diagram">┌─ Production Cluster ───────────────────────────┐
+│  Scheduler(=Worker) / Meta DB / Triggerer x3   │
+└───────────────────────┬────────────────────────┘
+                        │ (read-only access)
+┌─ Test Cluster ────────┴────────────────────────┐
+│  Scheduler(=Worker) / Triggerer x3             │
+│                                                │
+│  ✅ Sensors → Async sensors (CustomTrigger)    │
+│  ⬜ Other tasks → All replaced with EmptyOperator │
+└────────────────────────────────────────────────┘</div>
+  <ul>
+    <li>Test sensors <strong>read the production Meta DB</strong> (read-only) → tested under real conditions</li>
+    <li>All non-sensor tasks replaced with EmptyOperator → <strong>only sensors were tested</strong></li>
+    <li>Ran async sensors during the actual batch at night, then compared results with the existing sync sensors to <strong>check if detection was correct</strong></li>
+    <li>Ran continuously since May, monitoring for <strong>event loop blocking, memory leaks, and missed triggers</strong></li>
+  </ul>
+  <p>During testing, found a <strong>timeout problem</strong>. Which timeout it is turned out to matter. The sensor's own <code>timeout</code> parameter is measured from the <code>start_date</code> of the first <code>TaskReschedule</code> record of that try, so it does not reset on each poke and behaves similarly in both modes. The asymmetry comes from <code>execution_timeout</code>. In reschedule mode each poke is a separate task execution, so <code>_execute_task</code> passes the full <code>execution_timeout</code> every time — effectively resetting it. In deferred mode <code>_defer_task</code> pins <code>trigger_timeout = start_date + execution_timeout</code> once, and <code>start_date</code> is preserved across resumes, so the entire wait counts as one continuous run. Sensors that are supposed to wait for hours started failing from timeout even though they were working correctly. Removed the timeout setting for deferred sensors. A sensor stuck long enough to matter is caught by a separate SLA check instead — sensors poke frequently, so a per-task timeout was mostly firing on transient errors and waking people during the night batch.</p>
+  <figure>
+    <img src="./comparison.png" alt="Test cluster vs production comparison" style="max-width: 500px;">
+    <figcaption>Test cluster vs production after deployment</figcaption>
+  </figure>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Rollout</h2>
+  <p>Deployed gradually using DAG hash values: each sensor's DAG hash is divided by 100, and if the remainder is less than the target percentage, it runs in async mode. Rolled out 25% → 50% → 75% → 100%. Setting the target to 0 makes all sensors fall back to the original reschedule mode. After reaching 100% with no issues, async became the default. Code reviews and the DB caching approach were discussed with team members and the DBA team throughout the process.</p>
+  <p>After the full rollout, the sensor pool (which previously reserved 100 out of 200 Worker slots) was no longer needed. <strong>Set up a separate sensor pool with no slot limit</strong>, so all 2,500 sensors wait on the Triggerer and compute tasks can use all 200 parallelism slots.</p>
+
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Fixing real-time log visibility</h2>
+  <p>During testing, found that logs from sensors running on the Triggerer were not visible in real time — they only appeared all at once after task completion. Prioritized detection accuracy and stability verification first, and addressed this after the rollout stabilized.</p>
+  <ul>
+    <li><strong>Cause</strong> — Airflow builds a URL from the <code>host_name</code> the Triggerer registers in Meta DB to request logs, using <code>hostname_callable</code> first and falling back to FQDN.</li>
+  </ul>
+  <p style="font-size:9.5pt;color:#555;margin-bottom:6px;">Under LocalExecutor the scheduler also runs the tasks, so what would be a separate worker pod in other setups is the scheduler pod here.</p>
+  <table>
+    <tr><th></th><th>Deployment Type</th><th>Pod Name</th><th>DNS Resolution</th></tr>
+    <tr><td>Scheduler</td><td>StatefulSet</td><td>Stable</td><td>Resolvable via Headless Service</td></tr>
+    <tr><td>Triggerer</td><td>Deployment</td><td>Changes on deploy</td><td><strong>Not resolvable</strong></td></tr>
+  </table>
+  <ul>
+    <li><strong>Attempted</strong> — Created a Service for the Triggerer, but the value registered in Meta DB is the pod name itself, not the Service DNS — no effect</li>
+    <li><strong>Fixed</strong> — Set <code>hostname_callable</code> to <code>airflow.utils.net:get_host_ip_address</code> in the Helm Chart. Registers pod IP as the hostname — directly routable, real-time log retrieval works without DNS resolution</li>
+  </ul>
+</div>
+
+<hr>
+
+<div class="section">
+  <h2>Result</h2>
+  <table>
+    <tr><th></th><th>Before</th><th>After</th></tr>
+    <tr><td><strong>Sensor pool usage</strong></td><td>100 (always full)</td><td><strong>0 (pool not needed)</strong></td></tr>
+    <tr><td><strong>Scheduling delays (1 hour+)</strong></td><td>3–4 per month</td><td><strong>0</strong></td></tr>
+    <tr><td><strong>Compute task slots available</strong></td><td>~100 (half of parallelism)</td><td><strong>~200 (all available)</strong></td></tr>
+    <tr><td><strong>Batch failures (caused by sensors)</strong></td><td>Happened sometimes</td><td><strong>Resolved</strong></td></tr>
+  </table>
+  <p>Stable in production.</p>
+</div>
+
+<hr>
+
+<p>Through this experience, I confirmed how I want to work: when something breaks, trace it into the system internals and fix it there, rather than route around it.</p>
+
+<p class="tag">Apache Airflow 2.6.2 / Python asyncio / Triggerer</p>
+
+</body>
+</html>
