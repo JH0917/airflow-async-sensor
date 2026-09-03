@@ -177,8 +177,8 @@
   <h2>Environment</h2>
   <ul class="env-list">
     <li>Apache Airflow 2.6.2 / LocalExecutor (Scheduler = Worker)</li>
-    <li>Worker parallelism: 200 (sensor pool: 100 + compute task pool: 100) / Triggerer: 3 processes (capacity 1,000 each)</li>
-    <li>Custom sensors: sensors that query Meta DB to detect task and Sqoop completion. About 2,500 total</li>
+    <li>Worker parallelism: 200 (sensor pool: 100 + compute task pool: 100) / Triggerer: 3 processes (capacity 1,000 each, 3,000 total)</li>
+    <li>Custom sensors: sensors that query Meta DB to detect task and Sqoop completion. 3,500 total, about 2,500 running concurrently during the nightly batch</li>
   </ul>
 </div>
 
@@ -186,7 +186,7 @@
 
 <div class="section">
   <h2>Problem</h2>
-  <p>We had 200 total parallelism, and <strong>100 slots were reserved for a sensor-only pool</strong>. There were about 2,500 sensors running in reschedule mode — when a poke fails, the sensor gives back the Worker slot. But because 2,500 sensors were competing for 100 slots, whenever one slot was released, another sensor took it right away. So <strong>the sensor pool was always full at 100</strong>.</p>
+  <p>We had 200 total parallelism, and <strong>100 slots were reserved for a sensor-only pool</strong>. We had 3,500 sensors, about 2,500 of them running concurrently during the nightly batch, all in reschedule mode — when a poke fails, the sensor gives back the Worker slot. But because 2,500 sensors were competing for 100 slots, whenever one slot was released, another sensor took it right away. So <strong>the sensor pool was always full at 100</strong>.</p>
   <ul>
     <li><strong>Competition inside the sensor pool</strong> — 2,500 sensors fighting for 100 slots. When more than 100 needed to run at the same time, reschedule got delayed. There were cases where a finished task was not detected for over an hour. This happened 3–4 times per month.</li>
     <li><strong>Effect on compute tasks</strong> — The sensor pool was always using its full 100 slots, so compute tasks could only use 100 out of 200 parallelism. During peak batch hours, compute tasks also had to wait for slots.</li>
@@ -260,7 +260,7 @@ async def run_trigger(self, trigger_id, trigger):
   <h2>Pre-work 1: Making the Triggerer Stable</h2>
 
   <h3>1) Applying lazyload to bulk_fetch</h3>
-  <p>Heartbeat was not reaching the Scheduler even though the async thread and coroutines were running fine. Checked logs on the pod and ran <code>SHOW PROCESSLIST</code> on the Meta DB — found that a specific query was running for more than 10 minutes. Traced it back to the <code>bulk_fetch</code> function in the Airflow source code — in 2.6.2, the SQLAlchemy relationship on <code>task_instance</code> was configured to always inner join <code>dag_run</code>, even though the Triggerer never uses <code>dag_run</code> columns. This join was blocking the main loop for at least 205 seconds — the longest we measured before intervening — so heartbeat could not be sent. The consequence was not just a late signal — <code>Trigger.assign_unassigned</code> treats a Triggerer whose <code>latest_heartbeat</code> is older than <strong>30 seconds</strong> as dead and reassigns its triggers to another Triggerer. At nearly seven times that threshold (205s vs 30s), the Triggerer was losing its own triggers. <strong>Applied lazyload to disable this join</strong>, and heartbeat came back.</p>
+  <p>Heartbeat was not reaching the Scheduler even though the async thread and coroutines were running fine. Checked logs on the pod and ran <code>SHOW PROCESSLIST</code> on the Meta DB — found the bulk_fetch query holding the main loop while heartbeat gaps ran past 10 minutes. Traced it back to the <code>bulk_fetch</code> function in the Airflow source code — in 2.6.2, the SQLAlchemy relationship on <code>task_instance</code> was configured to always inner join <code>dag_run</code>, even though the Triggerer never uses <code>dag_run</code> columns. This join was blocking the main loop for at least 205 seconds — the longest we measured before intervening — so heartbeat could not be sent. The consequence was not just a late signal — <code>Trigger.assign_unassigned</code> treats a Triggerer whose <code>latest_heartbeat</code> is older than <strong>30 seconds</strong> as dead and reassigns its triggers to another Triggerer. At nearly seven times that threshold (205s vs 30s), the Triggerer was losing its own triggers. <strong>Applied lazyload to disable this join</strong>, and heartbeat came back.</p>
 
   <h3>2) Building a liveness check for deferred tasks</h3>
   <p>After fixing the heartbeat, a different problem appeared — some tasks got stuck in a <strong>permanently deferred</strong> state. Triggers were assigned but no coroutines were running. The exact root cause was unclear; suspected to be related to multi-triggerer interception in the open source, but never reproduced. Built a liveness check anyway: if <code>assigned_trigger_ids</code> exist but <code>running == 0 and queued == 0</code>, exit the loop and let the process restart. But this caused false positives — sometimes triggers were still in the middle of registering, not actually stuck. Improved it by adding a <strong><code>self._no_trigger_count</code> counter</strong> that only triggers the restart when this condition happens 5 times in a row.</p>
@@ -274,7 +274,7 @@ async def run_trigger(self, trigger_id, trigger):
   <p>If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not be able to handle this, so the load needed to be reduced before the migration.</p>
 
   <h3>1) Combining Sqoop sensors — per-table → per-host</h3>
-  <p>The custom sensors detect Sqoop completion by querying a DB. The Sqoop DAG (running on a different Airflow) also queries the same DB, so reducing queries on the Sqoop side also reduces load. In the existing Sqoop DAG, <strong>each table had its own sensor</strong>, running a separate SELECT per table. <strong>Combined these into 1 sensor per host</strong> to reduce query count (e.g. 200–300 queries per host → 1).</p>
+  <p>The custom sensors detect Sqoop completion by querying a DB. The Sqoop DAG (running on a different Airflow) also queries the same DB, so reducing queries on the Sqoop side also reduces load. In the existing Sqoop DAG, <strong>each table had its own sensor</strong>, running a separate SELECT per table. <strong>Combined these into 1 sensor per host</strong> to reduce query count (a host held ~300 tables on average, ranging 50–800, so several hundred queries per host collapsed into 1).</p>
 
   <h3>2) Airflow Variable caching</h3>
   <p>To prevent this query concentration, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought DB CPU from 70% → near 0%</strong>. The cache adds at most 5 minutes of staleness on top of the 3-minute poke interval. That was acceptable against what was being fixed — detections that were running over an hour late.</p>
@@ -282,11 +282,11 @@ async def run_trigger(self, trigger_id, trigger):
   <div class="img-container">
     <figure>
       <img src="./db_cpu_before.png" alt="DB CPU Before" style="width: 280px; height: 240px; object-fit: contain;">
-      <figcaption>Before optimization: CPU spiked to 70% during batch hours</figcaption>
+      <figcaption>Before caching: CPU spiked to 70% during batch hours</figcaption>
     </figure>
     <figure>
       <img src="./db_cpu_after.png" alt="DB CPU After" style="width: 280px; height: 240px; object-fit: contain;">
-      <figcaption>After optimization: CPU stays close to 0%</figcaption>
+      <figcaption>After caching: CPU stays close to 0%. The per-host consolidation cut the query count; this CPU drop is the Variable cache.</figcaption>
     </figure>
   </div>
 </div>
