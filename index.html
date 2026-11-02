@@ -168,7 +168,7 @@
 
 <h1>Moving Airflow Sensors to Async Execution</h1>
 <div class="highlight">
-  Sensor Worker slot usage: 100 → 0 / Scheduling delays: 3–4/month → 0 / Compute task slots: ~100 → ~200
+  Our nightly batch sometimes detected finished jobs over an hour late, because 2,500 waiting sensors competed for a limited pool of Worker slots. I moved them onto Airflow's async Triggerer in a staged rollout. Delays of an hour or more went from 3–4 a month to none, and compute tasks gained access to all 200 slots instead of about 100.
 </div>
 
 <hr>
@@ -188,7 +188,7 @@
   <h2>Problem</h2>
   <p>We had 200 total parallelism, and <strong>100 slots were reserved for a sensor-only pool</strong>. We had 3,500 sensors, about 2,500 of them running concurrently during the nightly batch, all in reschedule mode — when a poke fails, the sensor gives back the Worker slot. But because 2,500 sensors were competing for 100 slots, whenever one slot was released, another sensor took it right away. So <strong>the sensor pool was always full at 100</strong>.</p>
   <ul>
-    <li><strong>Competition inside the sensor pool</strong> — 2,500 sensors fighting for 100 slots. When more than 100 needed to run at the same time, reschedule got delayed. There were cases where a finished task was not detected for over an hour. This happened 3–4 times per month.</li>
+    <li><strong>Competition inside the sensor pool</strong> — 2,500 sensors fighting for 100 slots. This contention was always there, and tasks were arranged around it, so most nights still got through. But when one stage ran late, it got much worse: more sensors needed slots at the same time and reschedule fell behind. There were cases where a finished task was not detected for over an hour. This happened 3–4 times per month.</li>
     <li><strong>Effect on compute tasks</strong> — The sensor pool was always using its full 100 slots, so compute tasks could only use 100 out of 200 parallelism. During peak batch hours, compute tasks also had to wait for slots.</li>
   </ul>
 
@@ -251,7 +251,7 @@ async def run_trigger(self, trigger_id, trigger):
         self.triggers[trigger_id]["events"] += 1
         self.events.append((trigger_id, event))</code></pre>
   <p>When an Operator calls <code>self.defer()</code>, the <strong>Worker slot is released right away</strong>, and the waiting logic runs as a coroutine in the TriggerRunner's event loop. When the condition is met, the flow is: TriggerEvent → main thread's handle_event → Scheduler → Worker gets assigned again.</p>
-  <p>From this, confirmed that <strong>if the sensor's poke logic runs inside <code>BaseTrigger.run()</code> as a coroutine, the sensor can detect the same things without using any Worker slots</strong>.</p>
+  <p>From this, confirmed that <strong>if the sensor's poke logic runs inside <code>BaseTrigger.run()</code> as a coroutine, the sensor can detect the same things without holding a Worker slot while it waits</strong>.</p>
 </div>
 
 <hr>
@@ -260,24 +260,24 @@ async def run_trigger(self, trigger_id, trigger):
   <h2>Pre-work 1: Making the Triggerer Stable</h2>
 
   <h3>1) Applying lazyload to bulk_fetch</h3>
-  <p>Heartbeat was not reaching the Scheduler even though the async thread and coroutines were running fine. Checked logs on the pod and ran <code>SHOW PROCESSLIST</code> on the Meta DB — found the bulk_fetch query holding the main loop while heartbeat gaps ran past 10 minutes. Traced it back to the <code>bulk_fetch</code> function in the Airflow source code — in 2.6.2, the SQLAlchemy relationship on <code>task_instance</code> was configured to always inner join <code>dag_run</code>, even though the Triggerer never uses <code>dag_run</code> columns. This join was blocking the main loop for at least 205 seconds — the longest we measured before intervening — so heartbeat could not be sent. The consequence was not just a late signal — <code>Trigger.assign_unassigned</code> treats a Triggerer whose <code>latest_heartbeat</code> is older than <strong>30 seconds</strong> as dead and reassigns its triggers to another Triggerer. At nearly seven times that threshold (205s vs 30s), the Triggerer was losing its own triggers. <strong>Applied lazyload to disable this join</strong>, and heartbeat came back.</p>
+  <p>Heartbeat was not reaching the Scheduler even though the async thread and coroutines were running fine. Checked logs on the pod and ran <code>SHOW PROCESSLIST</code> on the Meta DB — found the bulk_fetch query holding the main loop while heartbeat gaps ran past 10 minutes. Traced it back to the <code>bulk_fetch</code> function in the Airflow source code — in 2.6.2, the SQLAlchemy relationship on <code>task_instance</code> was configured to always inner join <code>dag_run</code>, even though the Triggerer never uses <code>dag_run</code> columns. This join was blocking the main loop for at least 205 seconds, where I stopped timing it, and heartbeat stayed missing for over 10 minutes. The consequence was not just a late signal — <code>Trigger.assign_unassigned</code> treats a Triggerer whose <code>latest_heartbeat</code> is older than <strong>30 seconds</strong> as dead and reassigns its triggers to another Triggerer. Already nearly seven times that threshold at 205s, the Triggerer was losing its own triggers. <strong>Applied lazyload to disable this join</strong>, and heartbeat came back.</p>
 
   <h3>2) Building a liveness check for deferred tasks</h3>
   <p>After fixing the heartbeat, a different problem appeared — some tasks got stuck in a <strong>permanently deferred</strong> state. Triggers were assigned but no coroutines were running. The exact root cause was unclear; suspected to be related to multi-triggerer interception in the open source, but never reproduced. Built a liveness check anyway: if <code>assigned_trigger_ids</code> exist but <code>running == 0 and queued == 0</code>, exit the loop and let the process restart. But this caused false positives — sometimes triggers were still in the middle of registering, not actually stuck. Improved it by adding a <strong><code>self._no_trigger_count</code> counter</strong> that only triggers the restart when this condition happens 5 times in a row.</p>
-  <p> The in-house check kept it contained, but it left me interested in orphan triggers as a failure class in their own right. Airflow 3 had since restructured the Triggerer — the single main/async loop became a supervisor and a subprocess — so the code I had debugged in 2.6.2 no longer existed in that form. Reading the newer implementation, I found a distinct path to the same symptom: the supervisor can keep a trigger in <code>running_triggers</code> while no coroutine is actually running it in the subprocess, and the task stays deferred forever. I submitted a detection-and-recovery patch upstream — the supervisor compares its own <code>running_triggers</code> count against the subprocess's actual trigger count on every sync cycle, and when they diverge it drops only the stranded trigger ids so the next cycle rebuilds them, instead of shutting the whole Triggerer down. Shipped with a <code>triggers.state_mismatch</code> metric and tests. (<a href="https://github.com/apache/airflow/pull/68792">apache/airflow#68792</a>, milestone 3.3.2, under review)</p>
+  <p> The in-house check kept it contained, but it left me interested in orphan triggers as a failure class in their own right. Airflow 3 had since restructured the Triggerer — the single main/async loop became a supervisor and a subprocess — so the code I had debugged in 2.6.2 no longer existed in that form. Reading the newer implementation, I found a distinct path to the same symptom: the supervisor can keep a trigger in <code>running_triggers</code> while no coroutine is actually running it in the subprocess, and the task stays deferred forever. I submitted a detection-and-recovery patch upstream — the supervisor compares its own <code>running_triggers</code> count against the subprocess's actual trigger count on every sync cycle, and when they diverge it drops only the stranded trigger ids so the next cycle rebuilds them, instead of shutting the whole Triggerer down. Shipped with a <code>triggers.state_mismatch</code> metric and tests. (<a href="https://github.com/apache/airflow/pull/68792">apache/airflow#68792</a>)</p>
 </div>
 
 <hr>
 
 <div class="section">
   <h2>Pre-work 2: Reducing DB Load</h2>
-  <p>If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not be able to handle this, so the load needed to be reduced before the migration.</p>
+  <p>This was a separate problem from the slot contention. If 2,500 sensors all moved to the Triggerer, all their DB queries would hit the production DB at once. I expected the DB would not be able to handle this, so the load needed to be reduced before the migration.</p>
 
   <h3>1) Combining Sqoop sensors — per-table → per-host</h3>
   <p>The custom sensors detect Sqoop completion by querying a DB. The Sqoop DAG (running on a different Airflow) also queries the same DB, so reducing queries on the Sqoop side also reduces load. In the existing Sqoop DAG, <strong>each table had its own sensor</strong>, running a separate SELECT per table. <strong>Combined these into 1 sensor per host</strong> to reduce query count (a host held ~300 tables on average, ranging 50–800, so several hundred queries per host collapsed into 1).</p>
 
   <h3>2) Airflow Variable caching</h3>
-  <p>To prevent this query concentration, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought DB CPU from 70% → near 0%</strong>. The cache adds at most 5 minutes of staleness on top of the 3-minute poke interval. That was acceptable against what was being fixed — detections that were running over an hour late.</p>
+  <p>To keep 2,500 sensors from querying the DB directly after the move, changed it so that the data is queried once every 5 minutes and <strong>cached in an Airflow Variable</strong>. Sensors read the cached Variable instead of querying the DB directly. This <strong>brought peak DB CPU from 70% → about 10%</strong>. The cache adds at most 5 minutes of staleness on top of the 3-minute poke interval. That was acceptable against what was being fixed — detections that were running over an hour late.</p>
 
   <div class="img-container">
     <figure>
@@ -286,7 +286,7 @@ async def run_trigger(self, trigger_id, trigger):
     </figure>
     <figure>
       <img src="./db_cpu_after.png" alt="DB CPU After" style="width: 280px; height: 240px; object-fit: contain;">
-      <figcaption>After caching: CPU stays close to 0%. The per-host consolidation cut the query count; this CPU drop is the Variable cache.</figcaption>
+      <figcaption>After caching: CPU peaks around 10%. The per-host consolidation cut the query count; this CPU drop is the Variable cache.</figcaption>
     </figure>
   </div>
 </div>
@@ -375,7 +375,7 @@ async def run_trigger(self, trigger_id, trigger):
 <div class="section">
   <h2>Rollout</h2>
   <p>Deployed gradually using DAG hash values: each sensor's DAG hash is divided by 100, and if the remainder is less than the target percentage, it runs in async mode. Rolled out 25% → 50% → 75% → 100%. Setting the target to 0 makes all sensors fall back to the original reschedule mode. After reaching 100% with no issues, async became the default. Code reviews and the DB caching approach were discussed with team members and the DBA team throughout the process.</p>
-  <p>After the full rollout, the sensor pool (which previously reserved 100 out of 200 Worker slots) was no longer needed. <strong>Set up a separate sensor pool with no slot limit</strong>, so all 2,500 sensors wait on the Triggerer and compute tasks can use all 200 parallelism slots.</p>
+  <p>After the full rollout, the sensor pool (which previously reserved 100 out of 200 Worker slots) was no longer needed. <strong>Replaced that reservation with a sensor pool with no slot limit</strong>, so all 2,500 sensors wait on the Triggerer and compute tasks can use all 200 parallelism slots.</p>
 
 </div>
 
@@ -404,11 +404,11 @@ async def run_trigger(self, trigger_id, trigger):
   <h2>Result</h2>
   <table>
     <tr><th></th><th>Before</th><th>After</th></tr>
-    <tr><td><strong>Sensor pool usage</strong></td><td>100 (always full)</td><td><strong>0 (pool not needed)</strong></td></tr>
+    <tr><td><strong>Worker slots held by waiting sensors</strong></td><td>100 (always full)</td><td><strong>0 (used only to start and resume)</strong></td></tr>
     <tr><td><strong>Scheduling delays (1 hour+)</strong></td><td>3–4 per month</td><td><strong>0</strong></td></tr>
     <tr><td><strong>Compute task slots available</strong></td><td>~100 (half of parallelism)</td><td><strong>~200 (all available)</strong></td></tr>
   </table>
-  <p>Stable in production.</p>
+  <p>Rollout completed June 3, 2026, with no delays of an hour or more since.</p>
 </div>
 
 <hr>
