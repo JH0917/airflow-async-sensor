@@ -159,6 +159,8 @@
   }
   @media print {
     body { padding: 0; }
+    h2, h3 { break-after: avoid; }
+    figure, .img-container, pre, .diagram, table { break-inside: avoid; }
     .img-container img { max-width: 280px; }
     figure img { max-width: 300px; }
   }
@@ -226,7 +228,7 @@
         self.handle_failed_triggers()
         perform_heartbeat(self.job, ...)
         time.sleep(1)</code></pre>
-  <p><strong>Heartbeat blocked by <code>bulk_fetch</code>.</strong> The Triggerer stopped heartbeating while its coroutines kept running. <code>SHOW PROCESSLIST</code> showed a <code>bulk_fetch</code> query still running at 205s when I stopped watching. In 2.6.2, <code>TaskInstance.dag_run</code> is declared model-wide as <code>lazy="joined", innerjoin=True</code>, so this query joins <code>dag_run</code> even though it never uses it. Because <code>load_triggers()</code> runs before <code>perform_heartbeat</code> in that loop, it pushed the last heartbeat almost 10 minutes back, far past the 30 seconds after which other Triggerers take over its triggers. Applying <code>lazyload</code> to that join fixed it.</p>
+  <p><strong>Heartbeat blocked by <code>bulk_fetch</code>.</strong> The Triggerer stopped heartbeating while its coroutines kept running. <code>SHOW PROCESSLIST</code> on the Meta DB showed one query still running at 205s when I stopped watching, which I traced to <code>Trigger.bulk_fetch</code>. In 2.6.2, <code>TaskInstance.dag_run</code> is declared model-wide as <code>lazy="joined", innerjoin=True</code>, so this query joins <code>dag_run</code> even though it never uses it. Because <code>load_triggers()</code> runs before <code>perform_heartbeat</code> in that loop, it pushed the last heartbeat almost 10 minutes back, far past the 30 seconds after which other Triggerers take over its triggers. Applying <code>lazyload</code> to that join fixed it.</p>
 
   <p><strong>Tasks stuck in deferred.</strong> Some tasks stayed deferred with triggers assigned but no coroutine running; I could not reproduce the cause. I added a liveness check that restarts the process when assigned triggers exist but nothing is running or queued, and required 5 consecutive hits to avoid false positives while triggers were still registering.</p>
 </div>
@@ -237,7 +239,7 @@
   <h2>Reducing DB Load First</h2>
   <p>Once off the 100-slot pool, all 2,500 sensors would query the Sqoop status table freely. Two changes before migrating:</p>
   <ul>
-    <li><strong>Per-table → per-host Sqoop sensors</strong> in the Sqoop DAG (a different Airflow that queries the same table). A host holds ~300 tables on average (50–800), so hundreds of queries per host became one.</li>
+    <li><strong>Per-table → per-host Sqoop sensors</strong> in the Sqoop DAG (a different Airflow that queries the same table). A host holds ~300 tables on average (50–800), so hundreds of queries per host became one, cutting total load on the shared table.</li>
     <li><strong>Airflow Variable cache</strong>: the table is read once every 5 minutes and sensors read the Variable. Peak CPU on the Sqoop status DB went from <strong>70% (sync sensors, pre-migration) to about 10%</strong>. The cache adds up to 5 minutes on top of the 3-minute poke, acceptable against hour-long delays.</li>
   </ul>
   <div class="img-container">
@@ -261,8 +263,12 @@
     def execute(self, context):
         if not self.use_async:
             return super().execute(context)          # original reschedule path
-        self.defer(trigger=CustomTaskCompletionTrigger(self.target_task_id, self.poke_interval),
-                   method_name="on_complete")
+        self.defer(
+            trigger=CustomTaskCompletionTrigger(
+                self.target_task_id, self.poke_interval
+            ),
+            method_name="on_complete",
+        )
 
 class CustomTaskCompletionTrigger(BaseTrigger):
     async def run(self):
@@ -286,7 +292,7 @@ class CustomTaskCompletionTrigger(BaseTrigger):
 
 <div class="section">
   <h2>Upstream</h2>
-  <p>Airflow 3 split the Triggerer into a supervisor and a subprocess. Reading it, I found another path to the stuck-deferred symptom: the supervisor can keep a trigger in <code>running_triggers</code> while nothing runs it in the subprocess. My patch compares the two counts each sync cycle and drops only the stranded trigger ids so they are rebuilt, instead of restarting the whole Triggerer, with a <code>triggers.state_mismatch</code> metric and tests (<a href="https://github.com/apache/airflow/pull/68792">apache/airflow#68792</a>, submitted).</p>
+  <p>Airflow 3 split the Triggerer into a supervisor and a subprocess. Reading it, I found another path to the stuck-deferred symptom: the supervisor can keep a trigger in <code>running_triggers</code> while nothing runs it in the subprocess. My patch compares the trigger ids the supervisor tracks against the ones the subprocess actually runs each sync cycle and drops only the stranded ids so they are rebuilt, instead of restarting the whole Triggerer, with a <code>triggers.state_mismatch</code> metric and tests (<a href="https://github.com/apache/airflow/pull/68792">apache/airflow#68792</a>, submitted).</p>
 </div>
 
 <p class="tag">Apache Airflow 2.6.2 / Python asyncio / Triggerer</p>
