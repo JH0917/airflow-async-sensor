@@ -1,6 +1,6 @@
 # Moving Airflow Sensors to Async Execution
 
-A case study on migrating 3,500 Airflow sensors (~2,500 concurrent) from Worker slots to the
+A case study on migrating 3,500 Airflow sensors (~2,500 per nightly batch) from Worker slots to the
 Triggerer's asyncio event loop — including a heartbeat-blocking `bulk_fetch`
 JOIN, DB load reduction, isolated-cluster verification, a DAG-hash based
 progressive rollout, and an upstream patch to Apache Airflow
