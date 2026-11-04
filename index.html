@@ -238,7 +238,7 @@
   <h2>Reducing DB Load First</h2>
   <p>Once off the 100-slot pool, all 2,500 sensors would query the Sqoop status table freely. Two changes before migrating:</p>
   <ul>
-    <li><strong>Per-table → per-host Sqoop sensors</strong> in the Sqoop DAG (a different Airflow that queries the same table). A host holds ~300 tables on average (50–800), so hundreds of queries per host became one, cutting total load on the shared table.</li>
+    <li><strong>Per-table → per-host Sqoop sensors</strong> in the Sqoop DAG (a different Airflow that queries the same table). A host holds ~300 tables on average (50–800), so hundreds of DB connections and queries per host became one, cutting load on the shared table.</li>
     <li><strong>Airflow Variable cache</strong>: the table is read once every 5 minutes and sensors read the Variable. Peak CPU on the Sqoop status DB went from <strong>70% (sync sensors, pre-migration) to about 10%</strong>. The cache adds up to 5 minutes on top of the 3-minute poke, acceptable against hour-long delays.</li>
   </ul>
   <div class="img-container">
